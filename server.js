@@ -36,7 +36,7 @@ function getFileName(url, fallback) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// fetch + timeout wrapper. timeout=0 ဆို timeout မထား (stream download အတွက်)
+// fetch + timeout wrapper
 async function fetchT(url, options = {}, timeout = REQUEST_TIMEOUT) {
   if (!timeout || timeout <= 0) {
     return await fetch(url, options);
@@ -53,8 +53,8 @@ async function fetchT(url, options = {}, timeout = REQUEST_TIMEOUT) {
 async function openSourceStream(url) {
   const res = await fetchT(
     url,
-    { headers: { "User-Agent": "Mozilla/5.0 (RemoteUploader)" } },
-    0 // stream — timeout မထား
+    { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" } },
+    0 // stream — timeout မထားပါ
   );
   if (!res.ok && res.status !== 206 && res.status !== 200) {
     throw new Error(`Source download fail (HTTP ${res.status})`);
@@ -70,10 +70,10 @@ async function putWithRetry(targetUrl, headers, body, label) {
       const r = await fetchT(targetUrl, { method: "PUT", headers, body });
       if (r.ok || r.status === 201 || r.status === 204) return r;
       if (r.status === 413) {
-        throw new Error(`${label} fail (HTTP 413 — chunk ကြီးနေတယ်၊ CHUNK_SIZE လျှော့ပါ)`);
+        throw new Error(`${label} fail (HTTP 413 — chunk size ကြီးလွန်းသဖြင့် CHUNK_SIZE ကို လျှော့ချပါ)`);
       }
       if (r.status === 502 || r.status === 503 || r.status === 504) {
-        lastErr = new Error(`${label} fail (HTTP ${r.status} — server ယာယီ busy)`);
+        lastErr = new Error(`${label} fail (HTTP ${r.status} — server ယာယီမအားပါ)`);
         if (attempt < MAX_RETRY) {
           await sleep(3000 * attempt);
           continue;
@@ -102,7 +102,7 @@ async function putAssembleWithRetry(uploadDir, destination, total) {
             "OC-Total-Length": String(total),
           },
         },
-        300000
+        300000 // Assembly timeout ကို ၅ မိနစ်အထိ တိုးမြှင့်ထားသည်
       );
       if (r.ok || r.status === 201 || r.status === 204) return r;
       lastErr = new Error(`MOVE/assemble fail (HTTP ${r.status})`);
@@ -130,7 +130,7 @@ function buildPaths(name) {
 }
 
 // STREAM download → chunk ပြည့်တိုင်း dogpan ဆီ တင်
-async function streamUpload(url, name, total, onProgress) {
+async function streamUpload(url, name, total, onProgress, checkAborted) {
   const { uploadDir, destination } = buildPaths(name);
 
   let r = await fetchT(uploadDir, {
@@ -150,6 +150,9 @@ async function streamUpload(url, name, total, onProgress) {
   let pendingLen = 0;
 
   const flushChunk = async (chunkBuf) => {
+    if (checkAborted && checkAborted()) {
+      throw new Error("အသုံးပြုသူမှ ချိတ်ဆက်မှု ဖြတ်တောက်လိုက်ပါသည်");
+    }
     const chunkName = String(index).padStart(5, "0");
     await putWithRetry(
       `${uploadDir}/${chunkName}`,
@@ -169,25 +172,38 @@ async function streamUpload(url, name, total, onProgress) {
     if (CHUNK_DELAY > 0) await sleep(CHUNK_DELAY);
   };
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    pending.push(Buffer.from(value));
-    pendingLen += value.length;
+  try {
+    while (true) {
+      if (checkAborted && checkAborted()) {
+        throw new Error("အသုံးပြုသူမှ ချိတ်ဆက်မှု ဖြတ်တောက်လိုက်ပါသည်");
+      }
+      const { done, value } = await reader.read();
+      if (done) break;
+      pending.push(Buffer.from(value));
+      pendingLen += value.length;
 
-    while (pendingLen >= CHUNK_SIZE) {
-      const merged = Buffer.concat(pending, pendingLen);
-      const chunkBuf = merged.subarray(0, CHUNK_SIZE);
-      const rest = merged.subarray(CHUNK_SIZE);
-      await flushChunk(chunkBuf);
-      pending = rest.length ? [Buffer.from(rest)] : [];
-      pendingLen = rest.length;
+      while (pendingLen >= CHUNK_SIZE) {
+        const merged = Buffer.concat(pending, pendingLen);
+        const chunkBuf = merged.subarray(0, CHUNK_SIZE);
+        const rest = merged.subarray(CHUNK_SIZE);
+        await flushChunk(chunkBuf);
+        pending = rest.length ? [Buffer.from(rest)] : [];
+        pendingLen = rest.length;
+      }
     }
+
+    if (pendingLen > 0) {
+      const lastBuf = Buffer.concat(pending, pendingLen);
+      await flushChunk(lastBuf);
+    }
+  } finally {
+    // Memory ပြန်လည်ရှင်းလင်းပေးရန်
+    pending = null;
+    try { reader.releaseLock(); } catch (e) {}
   }
 
-  if (pendingLen > 0) {
-    const lastBuf = Buffer.concat(pending, pendingLen);
-    await flushChunk(lastBuf);
+  if (checkAborted && checkAborted()) {
+    throw new Error("ဖိုင်တွဲများ မပေါင်းစည်းမီ အသုံးပြုသူမှ ချိတ်ဆက်မှု ဖြတ်တောက်လိုက်ပါသည်");
   }
 
   const finalTotal = total > 0 ? total : uploaded;
@@ -199,7 +215,7 @@ async function streamUpload(url, name, total, onProgress) {
   return { destination, size: uploaded };
 }
 
-// ===== SSE (streaming) endpoint — connection abort မဖြစ်အောင် progress ပို့ =====
+// ===== SSE (streaming) endpoint =====
 app.get("/api/transfer-stream", async (req, res) => {
   const url = req.query.url;
   const filename = req.query.filename;
@@ -210,9 +226,17 @@ app.get("/api/transfer-stream", async (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
+  let aborted = false;
+  req.on("close", () => { aborted = true; });
+
   const send = (event, data) => {
-    res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    if (aborted || res.writableEnded) return;
+    try {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch (e) {
+      console.error("SSE write error:", e);
+    }
   };
 
   if (!url) {
@@ -224,13 +248,17 @@ app.get("/api/transfer-stream", async (req, res) => {
     return res.end();
   }
 
-  // browser disconnect စောင့်
-  let aborted = false;
-  req.on("close", () => { aborted = true; });
-
   // connection alive ဖို့ heartbeat (15s တိုင်း comment ပို့)
   const heartbeat = setInterval(() => {
-    if (!aborted) res.write(`: keep-alive\n\n`);
+    if (!aborted && !res.writableEnded) {
+      try {
+        res.write(`: keep-alive\n\n`);
+      } catch (e) {
+        clearInterval(heartbeat);
+      }
+    } else {
+      clearInterval(heartbeat);
+    }
   }, 15000);
 
   try {
@@ -240,18 +268,26 @@ app.get("/api/transfer-stream", async (req, res) => {
     try {
       const head = await fetchT(url, {
         method: "HEAD",
-        headers: { "User-Agent": "Mozilla/5.0" },
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
       });
       total = Number(head.headers.get("content-length") || 0);
-    } catch {}
+    } catch (e) {
+      console.log("HEAD request failed, proceeding without total size:", e.message);
+    }
 
     send("start", { filename: name, total });
 
-    const { destination, size } = await streamUpload(url, name, total, (uploaded, t) => {
-      if (aborted) return;
-      const pct = t > 0 ? Math.round((uploaded / t) * 100) : 0;
-      send("progress", { uploaded, total: t, percent: pct });
-    });
+    const { destination, size } = await streamUpload(
+      url,
+      name,
+      total,
+      (uploaded, t) => {
+        if (aborted) return;
+        const pct = t > 0 ? Math.round((uploaded / t) * 100) : 0;
+        send("progress", { uploaded, total: t, percent: pct });
+      },
+      () => aborted
+    );
 
     send("done", {
       ok: true,
@@ -262,14 +298,15 @@ app.get("/api/transfer-stream", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    send("error", { error: err.message });
+    const errMsg = err instanceof Error ? err.message : String(err);
+    send("error", { error: errMsg || "မသိနိုင်သော အမှားတစ်ခု ဖြစ်ပွားခဲ့သည်" });
   } finally {
     clearInterval(heartbeat);
-    res.end();
+    try { res.end(); } catch (e) {}
   }
 });
 
-// ===== ရိုးရိုး JSON endpoint (frontend အဟောင်းနဲ့လည်း တွဲသုံးနိုင်) =====
+// ===== ရိုးရိုး JSON endpoint =====
 app.post("/api/transfer", async (req, res) => {
   const { url, filename } = req.body;
   if (!url) return res.status(400).json({ ok: false, error: "URL လိုအပ်ပါတယ်" });
@@ -283,7 +320,7 @@ app.post("/api/transfer", async (req, res) => {
       const head = await fetchT(url, { method: "HEAD", headers: { "User-Agent": "Mozilla/5.0" } });
       total = Number(head.headers.get("content-length") || 0);
     } catch {}
-    const { destination, size } = await streamUpload(url, name, total);
+    const { destination, size } = await streamUpload(url, name, total, null, () => false);
     return res.json({
       ok: true,
       filename: name,
@@ -293,7 +330,8 @@ app.post("/api/transfer", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    return res.status(502).json({ ok: false, error: err.message });
+    const errMsg = err instanceof Error ? err.message : String(err);
+    return res.status(502).json({ ok: false, error: errMsg });
   }
 });
 
