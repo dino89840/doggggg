@@ -14,12 +14,17 @@ const WEBDAV_URL = (process.env.WEBDAV_URL || "https://dogpan.com/dav").replace(
 const WEBDAV_USER = process.env.WEBDAV_USER || "";
 const WEBDAV_PASS = process.env.WEBDAV_PASS || "";
 
-// Chunk size — Railway/Cloudflare proxy က ကြီးတဲ့ chunk ကို 413 ပြတတ်လို့
-// 8MB ထားတယ်။ (Nextcloud default က 10MB) chunk များတာ ကိစ္စမရှိ၊ နောက်မှ ပြန်ပေါင်းတယ်။
+// Chunk size — proxy 413 ရှောင်ဖို့ 8MB
 const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 8 * 1024 * 1024);
 
-// Chunk တစ်ခု upload fail ရင် ဘယ်နှစ်ကြိမ် ပြန်ကြိုးစားမလဲ
-const MAX_RETRY = Number(process.env.MAX_RETRY || 3);
+// Chunk fail ရင် retry — 502/503/504 (server ယာယီ error) တွေအတွက် ပိုများအောင် 6 ကြိမ်
+const MAX_RETRY = Number(process.env.MAX_RETRY || 6);
+
+// Chunk တစ်ခုပြီးတိုင်း server ကို မဖိအောင် ခဏနား (ms)
+const CHUNK_DELAY = Number(process.env.CHUNK_DELAY || 300);
+
+// Request တစ်ခုစီအတွက် timeout (ms) — server မတုံ့ပြန်ရင် hang မဖြစ်အောင်
+const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT || 120000);
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
@@ -37,12 +42,22 @@ function getFileName(url, fallback) {
   return fallback || `file_${Date.now()}`;
 }
 
-// small sleep helper (retry backoff အတွက်)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// fetch + timeout wrapper (AbortController)
+async function fetchT(url, options = {}, timeout = REQUEST_TIMEOUT) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
 
 // Source URL ကို download stream ဖွင့်ပြီး file size ယူ
 async function openSource(url) {
-  const res = await fetch(url, {
+  const res = await fetchT(url, {
     headers: { "User-Agent": "Mozilla/5.0 (RemoteUploader)" },
   });
   if (!res.ok) throw new Error(`Source download fail (HTTP ${res.status})`);
@@ -50,52 +65,66 @@ async function openSource(url) {
   return { res, size };
 }
 
-// ===== Helper: Range request နဲ့ chunk တစ်ပိုင်းကို download =====
+// ===== Helper: Range request နဲ့ chunk တစ်ပိုင်းကို download (retry နဲ့) =====
 async function fetchRange(url, start, end) {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (RemoteUploader)",
-      Range: `bytes=${start}-${end}`,
-    },
-  });
-  if (!res.ok && res.status !== 206 && res.status !== 200) {
-    throw new Error(`Range download fail (HTTP ${res.status})`);
-  }
-  const buf = Buffer.from(await res.arrayBuffer());
-  return buf;
-}
-
-// ===== Helper: PUT တစ်ကြိမ်ကို retry နဲ့ စမ်း =====
-async function putWithRetry(targetUrl, headers, body, label) {
   let lastErr;
   for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
     try {
-      const r = await fetch(targetUrl, { method: "PUT", headers, body });
-      if (r.ok || r.status === 201 || r.status === 204) return r;
-
-      // 413 ဆို chunk အရမ်းကြီးနေတယ်လို့ ရှင်းရှင်းပြောပေး
-      if (r.status === 413) {
-        throw new Error(
-          `${label} fail (HTTP 413 — chunk အရမ်းကြီးနေတယ်။ CHUNK_SIZE ကို လျှော့ပါ)`
-        );
+      const res = await fetchT(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (RemoteUploader)",
+          Range: `bytes=${start}-${end}`,
+        },
+      });
+      if (res.ok || res.status === 206 || res.status === 200) {
+        return Buffer.from(await res.arrayBuffer());
       }
-      lastErr = new Error(`${label} fail (HTTP ${r.status})`);
+      lastErr = new Error(`Range download fail (HTTP ${res.status})`);
     } catch (e) {
       lastErr = e;
     }
-    if (attempt < MAX_RETRY) await sleep(1000 * attempt); // backoff
+    if (attempt < MAX_RETRY) await sleep(1500 * attempt);
   }
   throw lastErr;
 }
 
-// ===== NEXTCLOUD-STYLE CHUNKED UPLOAD =====
-// DogPan က Nextcloud-based ဆိုရင် ဒီနည်း အလုပ်ဖြစ်ပါတယ်။
+// ===== Helper: PUT တစ်ကြိမ်ကို retry နဲ့ စမ်း (502/503/504 အတွက် ပိုကြာကြာစောင့်) =====
+async function putWithRetry(targetUrl, headers, body, label) {
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
+    try {
+      const r = await fetchT(targetUrl, { method: "PUT", headers, body });
+
+      if (r.ok || r.status === 201 || r.status === 204) return r;
+
+      // 413 — chunk အရမ်းကြီး၊ retry လုပ်လို့ အကျိုးမရှိ
+      if (r.status === 413) {
+        throw new Error(`${label} fail (HTTP 413 — chunk ကြီးနေတယ်၊ CHUNK_SIZE လျှော့ပါ)`);
+      }
+
+      // 502/503/504 — server ယာယီ error၊ ပိုကြာကြာ စောင့်ပြီး retry
+      if (r.status === 502 || r.status === 503 || r.status === 504) {
+        lastErr = new Error(`${label} fail (HTTP ${r.status} — server ယာယီ busy)`);
+        if (attempt < MAX_RETRY) {
+          await sleep(3000 * attempt); // 3s, 6s, 9s ... backoff
+          continue;
+        }
+      }
+
+      lastErr = new Error(`${label} fail (HTTP ${r.status})`);
+    } catch (e) {
+      lastErr = e;
+    }
+    if (attempt < MAX_RETRY) await sleep(2000 * attempt);
+  }
+  throw lastErr;
+}
+
+// ===== NEXTCLOUD-STYLE CHUNKED UPLOAD (Range download) =====
 async function chunkedUpload(url, name, total, onProgress) {
-  // userid ကို username ကနေ ယူ (Nextcloud က email ရဲ့ ရှေ့ပိုင်း သုံးတတ်)
   const userId = WEBDAV_USER.split("@")[0] || WEBDAV_USER;
   const base = WEBDAV_URL.replace(/\/dav$/, "").replace(/\/remote\.php\/dav$/, "");
 
-  // Nextcloud upload path
   const uploadRoot = `${base}/remote.php/dav/uploads/${userId}`;
   const filesRoot = `${base}/remote.php/dav/files/${userId}`;
   const uploadId = `remoteupload-${crypto.randomUUID()}`;
@@ -103,7 +132,7 @@ async function chunkedUpload(url, name, total, onProgress) {
   const destination = `${filesRoot}/${encodeURIComponent(name)}`;
 
   // 1) Upload folder ဆောက် (MKCOL)
-  let r = await fetch(uploadDir, {
+  let r = await fetchT(uploadDir, {
     method: "MKCOL",
     headers: { Authorization: authHeader(), Destination: destination },
   });
@@ -111,7 +140,7 @@ async function chunkedUpload(url, name, total, onProgress) {
     throw new Error(`MKCOL fail (HTTP ${r.status})`);
   }
 
-  // 2) Chunk တစ်ပိုင်းချင်း တင် (retry နဲ့)
+  // 2) Chunk တစ်ပိုင်းချင်း တင် (retry + delay)
   let index = 1;
   let uploaded = 0;
   for (let start = 0; start < total; start += CHUNK_SIZE) {
@@ -135,17 +164,13 @@ async function chunkedUpload(url, name, total, onProgress) {
     uploaded += chunk.length;
     index++;
     if (onProgress) onProgress(uploaded, total);
+
+    // server ကို မဖိအောင် ခဏနား
+    if (CHUNK_DELAY > 0) await sleep(CHUNK_DELAY);
   }
 
-  // 3) Chunk တွေ ပြန်ပေါင်း (MOVE .file → destination)
-  r = await fetch(`${uploadDir}/.file`, {
-    method: "MOVE",
-    headers: {
-      Authorization: authHeader(),
-      Destination: destination,
-      "OC-Total-Length": String(total),
-    },
-  });
+  // 3) Chunk တွေ ပြန်ပေါင်း (MOVE .file → destination) — assemble က ကြာတတ်လို့ timeout ပိုပေး
+  r = await putAssembleWithRetry(uploadDir, destination, total);
   if (!r.ok && r.status !== 201 && r.status !== 204) {
     throw new Error(`MOVE/assemble fail (HTTP ${r.status})`);
   }
@@ -153,13 +178,40 @@ async function chunkedUpload(url, name, total, onProgress) {
   return destination;
 }
 
-// ===== Fallback: size မသိတဲ့ဖိုင်ကို memory ထဲ stream → chunked upload =====
-// size မသိရင်လည်း direct PUT မလုပ်တော့ဘဲ download ပြီးမှ chunk အဖြစ်ပိုင်းတင်တယ်။
-// (Direct PUT ကြီးတဲ့ဖိုင်မှာ 413 ဖြစ်နိုင်လို့)
+// MOVE/assemble ကို retry နဲ့ (assemble က server ဘက် ကြာတတ်လို့ timeout ပိုကြီးပေး)
+async function putAssembleWithRetry(uploadDir, destination, total) {
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
+    try {
+      const r = await fetchT(
+        `${uploadDir}/.file`,
+        {
+          method: "MOVE",
+          headers: {
+            Authorization: authHeader(),
+            Destination: destination,
+            "OC-Total-Length": String(total),
+          },
+        },
+        300000 // assemble timeout 5 မိနစ်
+      );
+      if (r.ok || r.status === 201 || r.status === 204) return r;
+      lastErr = new Error(`MOVE/assemble fail (HTTP ${r.status})`);
+      if ((r.status === 502 || r.status === 503 || r.status === 504) && attempt < MAX_RETRY) {
+        await sleep(4000 * attempt);
+        continue;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+    if (attempt < MAX_RETRY) await sleep(3000 * attempt);
+  }
+  throw lastErr;
+}
+
+// ===== Fallback: size မသိ (သို့) Range မ support → download ပြီးမှ chunk တင် =====
 async function downloadThenChunkedUpload(url, name, onProgress) {
   const { res } = await openSource(url);
-
-  // stream ကို chunk array အဖြစ် စုဆောင်း (size မသိလို့)
   const reader = res.body.getReader();
   const parts = [];
   let total = 0;
@@ -170,12 +222,9 @@ async function downloadThenChunkedUpload(url, name, onProgress) {
     total += value.length;
   }
   const full = Buffer.concat(parts, total);
-
-  // size သိသွားပြီမို့ chunked upload အတွက် local buffer ကနေ ပိုင်းတင်
   return await chunkedUploadFromBuffer(full, name, onProgress);
 }
 
-// Buffer ကနေ chunked upload (Range download မလိုတော့ဘဲ buffer slice သုံး)
 async function chunkedUploadFromBuffer(buffer, name, onProgress) {
   const total = buffer.length;
   const userId = WEBDAV_USER.split("@")[0] || WEBDAV_USER;
@@ -187,7 +236,7 @@ async function chunkedUploadFromBuffer(buffer, name, onProgress) {
   const uploadDir = `${uploadRoot}/${uploadId}`;
   const destination = `${filesRoot}/${encodeURIComponent(name)}`;
 
-  let r = await fetch(uploadDir, {
+  let r = await fetchT(uploadDir, {
     method: "MKCOL",
     headers: { Authorization: authHeader(), Destination: destination },
   });
@@ -218,16 +267,10 @@ async function chunkedUploadFromBuffer(buffer, name, onProgress) {
     uploaded += chunk.length;
     index++;
     if (onProgress) onProgress(uploaded, total);
+    if (CHUNK_DELAY > 0) await sleep(CHUNK_DELAY);
   }
 
-  r = await fetch(`${uploadDir}/.file`, {
-    method: "MOVE",
-    headers: {
-      Authorization: authHeader(),
-      Destination: destination,
-      "OC-Total-Length": String(total),
-    },
-  });
+  r = await putAssembleWithRetry(uploadDir, destination, total);
   if (!r.ok && r.status !== 201 && r.status !== 204) {
     throw new Error(`MOVE/assemble fail (HTTP ${r.status})`);
   }
@@ -246,21 +289,18 @@ app.post("/api/transfer", async (req, res) => {
   try {
     const name = getFileName(url, filename);
 
-    // Source size စစ် (HEAD)
     let total = 0;
     let acceptRanges = false;
     try {
-      const head = await fetch(url, { method: "HEAD", headers: { "User-Agent": "Mozilla/5.0" } });
+      const head = await fetchT(url, { method: "HEAD", headers: { "User-Agent": "Mozilla/5.0" } });
       total = Number(head.headers.get("content-length") || 0);
       acceptRanges = (head.headers.get("accept-ranges") || "").includes("bytes");
     } catch {}
 
     let finalUrl;
     if (total > 0 && acceptRanges) {
-      // size သိ + Range support → chunked upload (memory မကုန်ဆုံး၊ အကောင်းဆုံး)
       finalUrl = await chunkedUpload(url, name, total);
     } else {
-      // size မသိ (သို့) Range မ support → download ပြီးမှ chunk အဖြစ် တင်
       finalUrl = await downloadThenChunkedUpload(url, name);
     }
 
