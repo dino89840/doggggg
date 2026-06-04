@@ -130,7 +130,7 @@ async function putWithRetry(targetUrl, headers, body, label) {
   let lastErr;
   for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
     try {
-      // Body can be a ReadStream
+      // Body is passed as a Buffer, totally safe for native fetch retries
       const r = await fetchT(targetUrl, { method: "PUT", headers, body });
       if (r.ok || r.status === 201 || r.status === 204) return r;
       lastErr = new Error(`${label} fail (HTTP ${r.status})`);
@@ -156,7 +156,7 @@ async function putAssembleWithRetry(uploadDir, destination, total) {
             "OC-Total-Length": String(total),
           },
         },
-        300000 // Assembly can take long
+        300000
       );
       if (r.ok || r.status === 201 || r.status === 204) return r;
       lastErr = new Error(`MOVE/assemble fail (HTTP ${r.status})`);
@@ -179,7 +179,19 @@ function buildPaths(name) {
   return { uploadDir, destination };
 }
 
-// ── Upload from local disk in chunks (0 MB RAM used!) ──
+// Helper to read file chunk safely into Buffer
+async function readChunkSlice(localPath, start, length) {
+  const fd = await fsp.open(localPath, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await fd.read(buffer, 0, length, start);
+    return bytesRead < length ? buffer.subarray(0, bytesRead) : buffer;
+  } finally {
+    await fd.close();
+  }
+}
+
+// ── Upload from local disk in chunks (No lock/disturbance errors) ──
 async function uploadFromDiskInChunks(localPath, name, onProgress) {
   const { uploadDir, destination } = buildPaths(name);
 
@@ -201,8 +213,8 @@ async function uploadFromDiskInChunks(localPath, name, onProgress) {
     const end = Math.min(start + CHUNK_SIZE - 1, totalSize - 1);
     const chunkLength = end - start + 1;
 
-    // Stream slice directly from disk without buffer allocation
-    const chunkStream = fs.createReadStream(localPath, { start, end });
+    // Read file slice directly into 8MB buffer to bypass stream lock issues
+    const chunkBuffer = await readChunkSlice(localPath, start, chunkLength);
     const chunkName = String(i + 1).padStart(5, "0");
 
     await putWithRetry(
@@ -214,7 +226,7 @@ async function uploadFromDiskInChunks(localPath, name, onProgress) {
         "Content-Type": "application/octet-stream",
         "Content-Length": String(chunkLength),
       },
-      chunkStream,
+      chunkBuffer, // Pass Buffer
       `Chunk ${i + 1}`
     );
 
