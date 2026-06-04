@@ -1,102 +1,157 @@
 <!DOCTYPE html>
 <html lang="my">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Remote Uploader → DogPan</title>
-    <style>
-      * { box-sizing: border-box; font-family: system-ui, sans-serif; }
-      body {
-        margin: 0; background: #f4f4f5; color: #18181b;
-        display: flex; justify-content: center; padding: 24px;
-      }
-      .card {
-        background: #fff; width: 100%; max-width: 480px;
-        border-radius: 16px; padding: 24px; box-shadow: 0 4px 20px rgba(0,0,0,.08);
-      }
-      h1 { font-size: 20px; margin: 0 0 4px; }
-      p.sub { margin: 0 0 20px; color: #71717a; font-size: 14px; }
-      label { font-size: 13px; color: #52525b; display: block; margin-bottom: 6px; }
-      input {
-        width: 100%; padding: 12px 14px; border: 1px solid #e4e4e7;
-        border-radius: 10px; font-size: 14px; margin-bottom: 16px;
-      }
-      button {
-        width: 100%; padding: 13px; border: none; border-radius: 10px;
-        background: #c2792f; color: #fff; font-size: 15px; font-weight: 600;
-        cursor: pointer;
-      }
-      button:disabled { opacity: .6; cursor: not-allowed; }
-      .result {
-        margin-top: 18px; padding: 14px; border-radius: 10px;
-        font-size: 14px; word-break: break-all; display: none;
-      }
-      .ok { background: #ecfdf5; color: #065f46; }
-      .err { background: #fef2f2; color: #991b1b; }
-      a { color: inherit; }
-    </style>
-  </head>
-  <body>
-    <div class="card">
-      <h1>Remote Upload</h1>
-      <p class="sub">Movie / file direct link ကို paste လုပ်ပြီး DogPan ထဲ တင်ပါ</p>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Remote Upload</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #f3f4f6;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 24px 16px;
+    }
+    .card {
+      background: #fff;
+      border-radius: 20px;
+      padding: 28px 24px;
+      width: 100%;
+      max-width: 420px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.08);
+      height: fit-content;
+    }
+    h1 { font-size: 24px; margin-bottom: 6px; }
+    .sub { color: #9ca3af; font-size: 14px; margin-bottom: 22px; line-height: 1.6; }
+    label { display: block; font-size: 14px; color: #6b7280; margin: 14px 0 6px; }
+    input {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      font-size: 15px;
+      outline: none;
+    }
+    input:focus { border-color: #c2783c; }
+    button {
+      width: 100%;
+      margin-top: 20px;
+      padding: 15px;
+      background: #c2783c;
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      font-size: 17px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .msg {
+      margin-top: 18px;
+      padding: 14px;
+      border-radius: 10px;
+      font-size: 15px;
+      display: none;
+    }
+    .msg.show { display: block; }
+    .msg.error { background: #fef2f2; color: #dc2626; }
+    .msg.success { background: #f0fdf4; color: #16a34a; }
+    .msg.info { background: #eff6ff; color: #2563eb; }
+    .bar-wrap {
+      margin-top: 16px;
+      height: 10px;
+      background: #e5e7eb;
+      border-radius: 6px;
+      overflow: hidden;
+      display: none;
+    }
+    .bar-wrap.show { display: block; }
+    .bar { height: 100%; width: 0%; background: #c2783c; transition: width 0.3s; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Remote Upload</h1>
+    <p class="sub">Movie / file direct link ကို paste လုပ်ပြီး DogPan ထဲ တင်ပါ</p>
 
-      <label>Direct Link (URL)</label>
-      <input id="url" type="url" placeholder="https://example.com/movie.mp4" />
+    <label>Direct Link (URL)</label>
+    <input id="url" type="text" placeholder="https://..." />
 
-      <label>Filename (optional)</label>
-      <input id="filename" type="text" placeholder="movie.mp4" />
+    <label>Filename (optional)</label>
+    <input id="filename" type="text" placeholder="movie.mp4" />
 
-      <button id="btn" onclick="transfer()">တင်မယ်</button>
+    <button id="btn">တင်မယ်</button>
 
-      <div id="result" class="result"></div>
-    </div>
+    <div class="bar-wrap" id="barWrap"><div class="bar" id="bar"></div></div>
+    <div class="msg" id="msg"></div>
+  </div>
 
-    <script>
-      async function transfer() {
-        const url = document.getElementById("url").value.trim();
-        const filename = document.getElementById("filename").value.trim();
-        const btn = document.getElementById("btn");
-        const result = document.getElementById("result");
+  <script>
+    const btn = document.getElementById("btn");
+    const msg = document.getElementById("msg");
+    const barWrap = document.getElementById("barWrap");
+    const bar = document.getElementById("bar");
 
-        if (!url) {
-          showResult(false, "URL ထည့်ပါ");
-          return;
-        }
+    function showMsg(text, type) {
+      msg.textContent = text;
+      msg.className = "msg show " + type;
+    }
 
-        btn.disabled = true;
-        btn.textContent = "တင်နေသည်... (ခဏစောင့်ပါ)";
-        result.style.display = "none";
+    btn.addEventListener("click", () => {
+      const url = document.getElementById("url").value.trim();
+      const filename = document.getElementById("filename").value.trim();
 
-        try {
-          const res = await fetch("/api/transfer", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ url, filename }),
-          });
-          const data = await res.json();
+      if (!url) { showMsg("✗ URL ထည့်ပါ", "error"); return; }
 
-          if (data.ok) {
-            showResult(true,
-              `✅ ${data.message}<br><b>${data.filename}</b><br>` +
-              `<a href="${data.url}" target="_blank">${data.url}</a>`);
-          } else {
-            showResult(false, "❌ " + data.error);
-          }
-        } catch (e) {
-          showResult(false, "❌ " + e.message);
-        } finally {
+      btn.disabled = true;
+      barWrap.classList.add("show");
+      bar.style.width = "0%";
+      showMsg("⏳ စတင်နေပါသည်...", "info");
+
+      // SSE — connection အကြာကြီး ဖွင့်ထားလို့ abort မဖြစ်
+      const q = new URLSearchParams({ url, filename });
+      const es = new EventSource("/api/transfer-stream?" + q.toString());
+
+      es.addEventListener("start", (e) => {
+        const d = JSON.parse(e.data);
+        const mb = d.total ? (d.total / 1048576).toFixed(1) + " MB" : "size မသိ";
+        showMsg("⬆ တင်နေပါသည်... (" + mb + ")", "info");
+      });
+
+      es.addEventListener("progress", (e) => {
+        const d = JSON.parse(e.data);
+        bar.style.width = d.percent + "%";
+        showMsg("⬆ တင်နေပါသည်... " + d.percent + "%", "info");
+      });
+
+      es.addEventListener("done", (e) => {
+        const d = JSON.parse(e.data);
+        bar.style.width = "100%";
+        showMsg("✓ " + (d.message || "အောင်မြင်စွာ တင်ပြီးပါပြီ"), "success");
+        btn.disabled = false;
+        es.close();
+      });
+
+      es.addEventListener("error", (e) => {
+        let err = "တင်မရပါ";
+        try { if (e.data) err = JSON.parse(e.data).error; } catch {}
+        showMsg("✗ " + err, "error");
+        btn.disabled = false;
+        barWrap.classList.remove("show");
+        es.close();
+      });
+
+      // connection ပြတ်သွားရင် (network)
+      es.onerror = () => {
+        if (btn.disabled) {
+          showMsg("✗ Connection ပြတ်သွားပါသည်", "error");
           btn.disabled = false;
-          btn.textContent = "တင်မယ်";
+          es.close();
         }
-      }
-
-      function showResult(ok, html) {
-        const result = document.getElementById("result");
-        result.className = "result " + (ok ? "ok" : "err");
-        result.innerHTML = html;
-        result.style.display = "block";
-      }
-    </script>
-  </body>
+      };
+    });
+  </script>
+</body>
 </html>
