@@ -19,9 +19,11 @@ const WEBDAV_URL = (process.env.WEBDAV_URL || "https://dogpan.com/dav").replace(
 const WEBDAV_USER = process.env.WEBDAV_USER || "";
 const WEBDAV_PASS = process.env.WEBDAV_PASS || "";
 
-const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 8 * 1024 * 1024); // 8MB chunks
+// Chunk size ကို 5MB သို့ လျှော့ချပြီး Server load ကို လျှော့ချထားပါသည်
+const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 5 * 1024 * 1024); 
 const MAX_RETRY = Number(process.env.MAX_RETRY || 6);
-const CHUNK_DELAY = Number(process.env.CHUNK_DELAY || 200);
+// Chunk တစ်ခုနှင့်တစ်ခုကြား ၁ စက္ကန့် (1000ms) ခြားပြီး DogPan ကို အသက်ရှူချိန်ပေးထားပါသည်
+const CHUNK_DELAY = Number(process.env.CHUNK_DELAY || 1000); 
 const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT || 120000);
 
 app.use(express.json());
@@ -130,10 +132,19 @@ async function putWithRetry(targetUrl, headers, body, label) {
   let lastErr;
   for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
     try {
-      // Body is passed as a Buffer, totally safe for native fetch retries
       const r = await fetchT(targetUrl, { method: "PUT", headers, body });
       if (r.ok || r.status === 201 || r.status === 204) return r;
+      
       lastErr = new Error(`${label} fail (HTTP ${r.status})`);
+
+      // DogPan (Nextcloud) ဘက်က Busy ဖြစ်ပြီး 502/503/504 ပေးပါက အချိန်ပိုစောင့်ပြီးမှ Retry ပြန်လုပ်ပါမည်
+      if (r.status === 502 || r.status === 503 || r.status === 504) {
+        console.warn(`[DogPan Busy] ${label} got HTTP ${r.status}. Attempt ${attempt}/${MAX_RETRY}. Waiting...`);
+        if (attempt < MAX_RETRY) {
+          await sleep(4000 * attempt); // 4s, 8s, 12s စသဖြင့် တိုးမြှင့်စောင့်ဆိုင်းပါမည်
+          continue;
+        }
+      }
     } catch (e) {
       lastErr = e;
     }
@@ -160,6 +171,13 @@ async function putAssembleWithRetry(uploadDir, destination, total) {
       );
       if (r.ok || r.status === 201 || r.status === 204) return r;
       lastErr = new Error(`MOVE/assemble fail (HTTP ${r.status})`);
+
+      if (r.status === 502 || r.status === 503 || r.status === 504) {
+        if (attempt < MAX_RETRY) {
+          await sleep(5000 * attempt);
+          continue;
+        }
+      }
     } catch (e) {
       lastErr = e;
     }
@@ -191,7 +209,7 @@ async function readChunkSlice(localPath, start, length) {
   }
 }
 
-// ── Upload from local disk in chunks (No lock/disturbance errors) ──
+// ── Upload from local disk in chunks ──
 async function uploadFromDiskInChunks(localPath, name, onProgress) {
   const { uploadDir, destination } = buildPaths(name);
 
@@ -213,7 +231,6 @@ async function uploadFromDiskInChunks(localPath, name, onProgress) {
     const end = Math.min(start + CHUNK_SIZE - 1, totalSize - 1);
     const chunkLength = end - start + 1;
 
-    // Read file slice directly into 8MB buffer to bypass stream lock issues
     const chunkBuffer = await readChunkSlice(localPath, start, chunkLength);
     const chunkName = String(i + 1).padStart(5, "0");
 
@@ -226,7 +243,7 @@ async function uploadFromDiskInChunks(localPath, name, onProgress) {
         "Content-Type": "application/octet-stream",
         "Content-Length": String(chunkLength),
       },
-      chunkBuffer, // Pass Buffer
+      chunkBuffer,
       `Chunk ${i + 1}`
     );
 
