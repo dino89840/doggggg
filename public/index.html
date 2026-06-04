@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="my">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Remote Uploader → DogPan</title>
+    <style>
+      * { box-sizing: border-box; font-family: system-ui, sans-serif; }
+      body {
+        margin: 0; background: #f4f4f5; color: #18181b;
+        display: flex; justify-content: center; padding: 24px;
+      }
+      .card {
+        background: #fff; width: 100%; max-width: 480px;
+        border-radius: 16px; padding: 24px; box-shadow: 0 4px 20px rgba(0,0,0,.08);
+      }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      p.sub { margin: 0 0 20px; color: #71717a; font-size: 14px; }
+      label { font-size: 13px; color: #52525b; display: block; margin-bottom: 6px; }
+      input {
+        width: 100%; padding: 12px 14px; border: 1px solid #e4e4e7;
+        border-radius: 10px; font-size: 14px; margin-bottom: 16px;
+      }
+      button {
+        width: 100%; padding: 13px; border: none; border-radius: 10px;
+        background: #c2792f; color: #fff; font-size: 15px; font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled { opacity: .6; cursor: not-allowed; }
+      .result {
+        margin-top: 18px; padding: 14px; border-radius: 10px;
+        font-size: 14px; word-break: break-all; display: none;
+      }
+      .ok { background: #ecfdf5; color: #065f46; }
+      .err { background: #fef2f2; color: #991b1b; }
+      a { color: inherit; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Remote Upload</h1>
+      <p class="sub">Movie / file direct link ကို paste လုပ်ပြီး DogPan ထဲ တင်ပါ</p>
+
+      <label>Direct Link (URL)</label>
+      <input id="url" type="url" placeholder="https://example.com/movie.mp4" />
+
+      <label>Filename (optional)</label>
+      <input id="filename" type="text" placeholder="movie.mp4" />
+
+      <button id="btn" onclick="transfer()">တင်မယ်</button>
+
+      <div id="result" class="result"></div>
+    </div>
+
+    <script>
+      async function transfer() {
+        const url = document.getElementById("url").value.trim();
+        const filename = document.getElementById("filename").value.trim();
+        const btn = document.getElementById("btn");
+        const result = document.getElementById("result");
+
+        if (!url) {
+          showResult(false, "URL ထည့်ပါ");
+          return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = "တင်နေသည်... (ခဏစောင့်ပါ)";
+        result.style.display = "none";
+
+        try {
+          const res = await fetch("/api/transfer", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url, filename }),
+          });
+          const data = await res.json();
+
+          if (data.ok) {
+            showResult(true,
+              `✅ ${data.message}<br><b>${data.filename}</b><br>` +
+              `<a href="${data.url}" target="_blank">${data.url}</a>`);
+          } else {
+            showResult(false, "❌ " + data.error);
+          }
+        } catch (e) {
+          showResult(false, "❌ " + e.message);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "တင်မယ်";
+        }
+      }
+
+      function showResult(ok, html) {
+        const result = document.getElementById("result");
+        result.className = "result " + (ok ? "ok" : "err");
+        result.innerHTML = html;
+        result.style.display = "block";
+      }
+    </script>
+  </body>
+</html>
