@@ -2,6 +2,12 @@ import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
+import fs from "fs";
+import fsp from "fs/promises";
+import os from "os";
+import http from "http";
+import https from "https";
+import { pipeline } from "stream/promises";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,13 +19,17 @@ const WEBDAV_URL = (process.env.WEBDAV_URL || "https://dogpan.com/dav").replace(
 const WEBDAV_USER = process.env.WEBDAV_USER || "";
 const WEBDAV_PASS = process.env.WEBDAV_PASS || "";
 
-const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 8 * 1024 * 1024);
+const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 8 * 1024 * 1024); // 8MB chunks
 const MAX_RETRY = Number(process.env.MAX_RETRY || 6);
-const CHUNK_DELAY = Number(process.env.CHUNK_DELAY || 300);
+const CHUNK_DELAY = Number(process.env.CHUNK_DELAY || 200);
 const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT || 120000);
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
+
+// ── HTTP Agents for High Speed ──
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 64 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64 });
 
 function authHeader() {
   return "Basic " + Buffer.from(`${WEBDAV_USER}:${WEBDAV_PASS}`).toString("base64");
@@ -36,7 +46,6 @@ function getFileName(url, fallback) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// fetch + timeout wrapper
 async function fetchT(url, options = {}, timeout = REQUEST_TIMEOUT) {
   if (!timeout || timeout <= 0) {
     return await fetch(url, options);
@@ -50,35 +59,80 @@ async function fetchT(url, options = {}, timeout = REQUEST_TIMEOUT) {
   }
 }
 
-async function openSourceStream(url) {
-  const res = await fetchT(
-    url,
-    { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" } },
-    0 // stream — timeout မထားပါ
-  );
-  if (!res.ok && res.status !== 206 && res.status !== 200) {
-    throw new Error(`Source download fail (HTTP ${res.status})`);
+// ── Background Jobs Store ──
+const jobs = new Map();
+function newJob() {
+  const id = crypto.randomBytes(8).toString("hex");
+  const job = {
+    id,
+    status: "pending",
+    loaded: 0,
+    total: 0,
+    percent: 0,
+    result: null,
+    error: null,
+    listeners: new Set(),
+    createdAt: Date.now(),
+  };
+  jobs.set(id, job);
+  setTimeout(() => jobs.delete(id), 2 * 60 * 60 * 1000); // Clean after 2 hours
+  return job;
+}
+
+function emit(job, patch = {}) {
+  Object.assign(job, patch);
+  const payload = JSON.stringify({
+    status: job.status,
+    loaded: job.loaded,
+    total: job.total,
+    percent: job.percent,
+    result: job.result,
+    error: job.error,
+  });
+  for (const res of job.listeners) {
+    try { res.write(`data: ${payload}\n\n`); } catch (_) {}
   }
-  const size = Number(res.headers.get("content-length") || 0);
-  return { res, size };
+}
+
+// ── Local Disk Downloader with progress ──
+function downloadToFile(url, destPath, onProgress) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith("https") ? https : http;
+    const req = lib.get(url, {
+      agent: url.startsWith("https") ? httpsAgent : httpAgent,
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*" },
+    }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        downloadToFile(next, destPath, onProgress).then(resolve, reject);
+        return;
+      }
+      if (res.statusCode !== 200 && res.statusCode !== 206) {
+        res.resume();
+        return reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+      }
+      const total = Number(res.headers["content-length"]) || 0;
+      let loaded = 0;
+      res.on("data", (chunk) => {
+        loaded += chunk.length;
+        if (onProgress) onProgress(loaded, total);
+      });
+      const ws = fs.createWriteStream(destPath);
+      pipeline(res, ws).then(() => resolve({ total: total || loaded })).catch(reject);
+    });
+    req.on("error", reject);
+    req.setTimeout(180000, () => req.destroy(new Error("Download timeout")));
+  });
 }
 
 async function putWithRetry(targetUrl, headers, body, label) {
   let lastErr;
   for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
     try {
+      // Body can be a ReadStream
       const r = await fetchT(targetUrl, { method: "PUT", headers, body });
       if (r.ok || r.status === 201 || r.status === 204) return r;
-      if (r.status === 413) {
-        throw new Error(`${label} fail (HTTP 413 — chunk size ကြီးလွန်းသဖြင့် CHUNK_SIZE ကို လျှော့ချပါ)`);
-      }
-      if (r.status === 502 || r.status === 503 || r.status === 504) {
-        lastErr = new Error(`${label} fail (HTTP ${r.status} — server ယာယီမအားပါ)`);
-        if (attempt < MAX_RETRY) {
-          await sleep(3000 * attempt);
-          continue;
-        }
-      }
       lastErr = new Error(`${label} fail (HTTP ${r.status})`);
     } catch (e) {
       lastErr = e;
@@ -102,14 +156,10 @@ async function putAssembleWithRetry(uploadDir, destination, total) {
             "OC-Total-Length": String(total),
           },
         },
-        300000 // Assembly timeout ကို ၅ မိနစ်အထိ တိုးမြှင့်ထားသည်
+        300000 // Assembly can take long
       );
       if (r.ok || r.status === 201 || r.status === 204) return r;
       lastErr = new Error(`MOVE/assemble fail (HTTP ${r.status})`);
-      if ((r.status === 502 || r.status === 503 || r.status === 504) && attempt < MAX_RETRY) {
-        await sleep(4000 * attempt);
-        continue;
-      }
     } catch (e) {
       lastErr = e;
     }
@@ -129,8 +179,8 @@ function buildPaths(name) {
   return { uploadDir, destination };
 }
 
-// STREAM download → chunk ပြည့်တိုင်း dogpan ဆီ တင်
-async function streamUpload(url, name, total, onProgress, checkAborted) {
+// ── Upload from local disk in chunks (0 MB RAM used!) ──
+async function uploadFromDiskInChunks(localPath, name, onProgress) {
   const { uploadDir, destination } = buildPaths(name);
 
   let r = await fetchT(uploadDir, {
@@ -141,199 +191,139 @@ async function streamUpload(url, name, total, onProgress, checkAborted) {
     throw new Error(`MKCOL fail (HTTP ${r.status})`);
   }
 
-  const { res } = await openSourceStream(url);
-  const reader = res.body.getReader();
-
-  let index = 1;
+  const stat = fs.statSync(localPath);
+  const totalSize = stat.size;
+  const totalChunks = Math.ceil(totalSize / CHUNK_SIZE);
   let uploaded = 0;
-  let pending = [];
-  let pendingLen = 0;
 
-  const flushChunk = async (chunkBuf) => {
-    if (checkAborted && checkAborted()) {
-      throw new Error("အသုံးပြုသူမှ ချိတ်ဆက်မှု ဖြတ်တောက်လိုက်ပါသည်");
-    }
-    const chunkName = String(index).padStart(5, "0");
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE - 1, totalSize - 1);
+    const chunkLength = end - start + 1;
+
+    // Stream slice directly from disk without buffer allocation
+    const chunkStream = fs.createReadStream(localPath, { start, end });
+    const chunkName = String(i + 1).padStart(5, "0");
+
     await putWithRetry(
       `${uploadDir}/${chunkName}`,
       {
         Authorization: authHeader(),
         Destination: destination,
-        "OC-Total-Length": String(total || 0),
+        "OC-Total-Length": String(totalSize),
         "Content-Type": "application/octet-stream",
-        "Content-Length": String(chunkBuf.length),
+        "Content-Length": String(chunkLength),
       },
-      chunkBuf,
-      `Chunk ${index}`
+      chunkStream,
+      `Chunk ${i + 1}`
     );
-    uploaded += chunkBuf.length;
-    index++;
-    if (onProgress) onProgress(uploaded, total);
+
+    uploaded += chunkLength;
+    if (onProgress) onProgress(uploaded, totalSize);
     if (CHUNK_DELAY > 0) await sleep(CHUNK_DELAY);
-  };
-
-  try {
-    while (true) {
-      if (checkAborted && checkAborted()) {
-        throw new Error("အသုံးပြုသူမှ ချိတ်ဆက်မှု ဖြတ်တောက်လိုက်ပါသည်");
-      }
-      const { done, value } = await reader.read();
-      if (done) break;
-      pending.push(Buffer.from(value));
-      pendingLen += value.length;
-
-      while (pendingLen >= CHUNK_SIZE) {
-        const merged = Buffer.concat(pending, pendingLen);
-        const chunkBuf = merged.subarray(0, CHUNK_SIZE);
-        const rest = merged.subarray(CHUNK_SIZE);
-        await flushChunk(chunkBuf);
-        pending = rest.length ? [Buffer.from(rest)] : [];
-        pendingLen = rest.length;
-      }
-    }
-
-    if (pendingLen > 0) {
-      const lastBuf = Buffer.concat(pending, pendingLen);
-      await flushChunk(lastBuf);
-    }
-  } finally {
-    // Memory ပြန်လည်ရှင်းလင်းပေးရန်
-    pending = null;
-    try { reader.releaseLock(); } catch (e) {}
   }
 
-  if (checkAborted && checkAborted()) {
-    throw new Error("ဖိုင်တွဲများ မပေါင်းစည်းမီ အသုံးပြုသူမှ ချိတ်ဆက်မှု ဖြတ်တောက်လိုက်ပါသည်");
-  }
-
-  const finalTotal = total > 0 ? total : uploaded;
-  r = await putAssembleWithRetry(uploadDir, destination, finalTotal);
+  r = await putAssembleWithRetry(uploadDir, destination, totalSize);
   if (!r.ok && r.status !== 201 && r.status !== 204) {
     throw new Error(`MOVE/assemble fail (HTTP ${r.status})`);
   }
 
-  return { destination, size: uploaded };
+  return { destination, size: totalSize };
 }
 
-// ===== SSE (streaming) endpoint =====
-app.get("/api/transfer-stream", async (req, res) => {
-  const url = req.query.url;
-  const filename = req.query.filename;
+// ── Main Async Runner ──
+async function runUpload(job, url, filename) {
+  const tmpRoot = path.join(os.tmpdir(), `dogpan-${job.id}`);
+  await fsp.mkdir(tmpRoot, { recursive: true });
+  const localFile = path.join(tmpRoot, "download.tmp");
 
-  // SSE headers
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
+  try {
+    const name = getFileName(url, filename);
+
+    // Phase 1: Download to Local Disk (0% to 40% progress)
+    emit(job, { status: "downloading", percent: 0 });
+    await downloadToFile(url, localFile, (loaded, total) => {
+      const pct = total ? Math.floor((loaded / total) * 40) : 0;
+      emit(job, { loaded, total, percent: pct });
+    });
+
+    // Phase 2: Upload Chunks from Disk to WebDAV (40% to 95% progress)
+    emit(job, { status: "uploading", percent: 40 });
+    const { destination, size } = await uploadFromDiskInChunks(localFile, name, (uploaded, total) => {
+      const pct = total ? Math.floor(40 + (uploaded / total) * 55) : 40;
+      emit(job, { loaded: uploaded, total, percent: pct });
+    });
+
+    // Finished
+    emit(job, {
+      status: "done",
+      percent: 100,
+      result: {
+        destination,
+        size,
+        message: "အောင်မြင်စွာ တင်ပြီးပါပြီ",
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    emit(job, { status: "error", error: err.message || "တင်မရပါ" });
+  } finally {
+    // Cleanup temporary files
+    fsp.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+    for (const res of job.listeners) {
+      try { res.end(); } catch (_) {}
+    }
+    job.listeners.clear();
+  }
+}
+
+// ── Routes ──
+app.post("/api/upload", (req, res) => {
+  const { url, filename } = req.body || {};
+  if (!url) return res.status(400).json({ error: "URL လိုအပ်ပါသည်" });
+  if (!WEBDAV_USER || !WEBDAV_PASS) {
+    return res.status(500).json({ error: "WEBDAV config များ မစုံလင်ပါ" });
+  }
+
+  const job = newJob();
+  runUpload(job, url, filename).catch(() => {});
+  res.json({ jobId: job.id });
+});
+
+// SSE progress monitor
+app.get("/api/progress/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).end();
+
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
   res.flushHeaders?.();
 
-  let aborted = false;
-  req.on("close", () => { aborted = true; });
+  // Initial event
+  res.write(`data: ${JSON.stringify({
+    status: job.status, loaded: job.loaded, total: job.total, percent: job.percent, result: job.result, error: job.error
+  })}\n\n`);
 
-  const send = (event, data) => {
-    if (aborted || res.writableEnded) return;
-    try {
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    } catch (e) {
-      console.error("SSE write error:", e);
-    }
-  };
-
-  if (!url) {
-    send("error", { error: "URL လိုအပ်ပါတယ်" });
-    return res.end();
-  }
-  if (!WEBDAV_USER || !WEBDAV_PASS) {
-    send("error", { error: "WEBDAV_USER / WEBDAV_PASS env မထည့်ရသေးပါ" });
+  if (job.status === "done" || job.status === "error") {
     return res.end();
   }
 
-  // connection alive ဖို့ heartbeat (15s တိုင်း comment ပို့)
-  const heartbeat = setInterval(() => {
-    if (!aborted && !res.writableEnded) {
-      try {
-        res.write(`: keep-alive\n\n`);
-      } catch (e) {
-        clearInterval(heartbeat);
-      }
-    } else {
-      clearInterval(heartbeat);
-    }
-  }, 15000);
-
-  try {
-    const name = getFileName(url, filename);
-
-    let total = 0;
-    try {
-      const head = await fetchT(url, {
-        method: "HEAD",
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
-      });
-      total = Number(head.headers.get("content-length") || 0);
-    } catch (e) {
-      console.log("HEAD request failed, proceeding without total size:", e.message);
-    }
-
-    send("start", { filename: name, total });
-
-    const { destination, size } = await streamUpload(
-      url,
-      name,
-      total,
-      (uploaded, t) => {
-        if (aborted) return;
-        const pct = t > 0 ? Math.round((uploaded / t) * 100) : 0;
-        send("progress", { uploaded, total: t, percent: pct });
-      },
-      () => aborted
-    );
-
-    send("done", {
-      ok: true,
-      filename: name,
-      url: destination,
-      size: size || total,
-      message: "အောင်မြင်စွာ တင်ပြီးပါပြီ",
-    });
-  } catch (err) {
-    console.error(err);
-    const errMsg = err instanceof Error ? err.message : String(err);
-    send("error", { error: errMsg || "မသိနိုင်သော အမှားတစ်ခု ဖြစ်ပွားခဲ့သည်" });
-  } finally {
-    clearInterval(heartbeat);
-    try { res.end(); } catch (e) {}
-  }
+  job.listeners.add(res);
+  req.on("close", () => job.listeners.delete(res));
 });
 
-// ===== ရိုးရိုး JSON endpoint =====
-app.post("/api/transfer", async (req, res) => {
-  const { url, filename } = req.body;
-  if (!url) return res.status(400).json({ ok: false, error: "URL လိုအပ်ပါတယ်" });
-  if (!WEBDAV_USER || !WEBDAV_PASS) {
-    return res.status(500).json({ ok: false, error: "WEBDAV_USER / WEBDAV_PASS env မထည့်ရသေးပါ" });
+// Keep-Alive for SSE
+setInterval(() => {
+  for (const job of jobs.values()) {
+    if (job.listeners.size === 0) continue;
+    for (const res of job.listeners) {
+      try { res.write(`: keep-alive\n\n`); } catch (_) {}
+    }
   }
-  try {
-    const name = getFileName(url, filename);
-    let total = 0;
-    try {
-      const head = await fetchT(url, { method: "HEAD", headers: { "User-Agent": "Mozilla/5.0" } });
-      total = Number(head.headers.get("content-length") || 0);
-    } catch {}
-    const { destination, size } = await streamUpload(url, name, total, null, () => false);
-    return res.json({
-      ok: true,
-      filename: name,
-      url: destination,
-      size: size || total,
-      message: "အောင်မြင်စွာ တင်ပြီးပါပြီ",
-    });
-  } catch (err) {
-    console.error(err);
-    const errMsg = err instanceof Error ? err.message : String(err);
-    return res.status(502).json({ ok: false, error: errMsg });
-  }
-});
+}, 15000).unref();
 
 app.get("/health", (req, res) => res.json({ ok: true }));
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 DogPan Server on port ${PORT}`));
