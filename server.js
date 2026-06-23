@@ -14,12 +14,21 @@ const PORT = process.env.PORT || 3000;
 // ── Config ──
 // dogpan = Cloudreve V4. API base = https://dogpan.com
 const API_BASE = (process.env.DOGPAN_API || "https://dogpan.com").replace(/\/+$/, "");
+
 // Cloudreve login token (Bearer). ပုံထဲက Authorization: Bearer eyJhbG... အတိုင်း
 const DOGPAN_TOKEN = process.env.DOGPAN_TOKEN || "";
+
+// ⚠️ session cookie — ပုံ(2:38PM) ထဲက Cookie: server_name_session=... အတိုင်း ထည့်ပါ။
+//   ဥပမာ: DOGPAN_COOKIE="server_name_session=2a1841d7b53b8873ef7bf7d10e371077"
+//   token တစ်ခုတည်းနဲ့ 401 ဖြစ်တာ ဒီ cookie မပါလို့ပါ။
+const DOGPAN_COOKIE = process.env.DOGPAN_COOKIE || "";
+
 // upload လုပ်မယ့် target folder (cloudreve URI). ဥပမာ cloudreve://my/iiii
 const DEST_URI = (process.env.DOGPAN_DEST_URI || "cloudreve://my").replace(/\/+$/, "");
-// storage policy id — ⚠️ ပုံထဲက အတိုင်း "Gwc1" (G-w-c-ONE). env မှာ မှန်အောင်ထည့်ပါ!
-const POLICY_ID = process.env.DOGPAN_POLICY_ID || "Gwc1";
+
+// ⚠️ storage policy id — ပုံ(1:37 & 1:51 PM) ထဲက အတိုင်း "GwcL" (G-w-c-အင်္ဂလိပ် L)။
+//   "Gwc1"(ဂဏန်းတစ်) မဟုတ်ပါ! env နဲ့ override လို့ရတယ်။
+const POLICY_ID = process.env.DOGPAN_POLICY_ID || "GwcL";
 
 const MAX_RETRY = Number(process.env.MAX_RETRY || 4);
 const DL_TIMEOUT = Number(process.env.DL_TIMEOUT || 600000);
@@ -70,10 +79,13 @@ function apiRequest(method, urlPath, body, extraHeaders = {}) {
 
     const headers = {
       Accept: "application/json, text/plain, */*",
-      "User-Agent": "Mozilla/5.0",
+      "User-Agent":
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
       ...extraHeaders,
     };
+    // ⚠️ Cloudreve V4 (dogpan) က Bearer token ရော session cookie ရော နှစ်ခုလုံး လိုတတ်တယ်
     if (DOGPAN_TOKEN) headers["Authorization"] = `Bearer ${DOGPAN_TOKEN}`;
+    if (DOGPAN_COOKIE) headers["Cookie"] = DOGPAN_COOKIE;
     if (data) {
       headers["Content-Type"] = "application/json";
       headers["Content-Length"] = String(data.length);
@@ -95,12 +107,17 @@ function apiRequest(method, urlPath, body, extraHeaders = {}) {
           let json = null;
           try { json = JSON.parse(raw); } catch {}
           // Cloudreve က HTTP 200 ထဲမှာ code != 0 နဲ့ error ပြန်တတ်တယ်
-          if (res.statusCode >= 200 && res.statusCode < 300 && (!json || json.code === undefined || json.code === 0)) {
+          if (
+            res.statusCode >= 200 && res.statusCode < 300 &&
+            (!json || json.code === undefined || json.code === 0)
+          ) {
             resolve({ status: res.statusCode, json, raw });
           } else {
             const msg = json?.msg || raw.slice(0, 300);
             const code = json?.code !== undefined ? json.code : res.statusCode;
-            reject(new Error(`API ${method} ${urlPath} -> code ${code}: ${msg}`));
+            const err = new Error(`API ${method} ${urlPath} -> code ${code}: ${msg}`);
+            err.code = code;
+            reject(err);
           }
         });
       }
@@ -270,32 +287,43 @@ async function cloudreveUpload(job, sourceUrl, filename) {
 
   const name = filename || cdName || getFileName(sourceUrl);
   const size = buffer.length;
-  // mime — source ရဲ့ content-type ရှိရင် သုံး၊ မရှိရင် ext ကနေ ခန့်မှန်း
-  const mime = (contentType && !contentType.includes("octet-stream")) ? contentType.split(";")[0] : guessMime(name);
+  const mime =
+    (contentType && !contentType.includes("octet-stream"))
+      ? contentType.split(";")[0]
+      : guessMime(name);
 
   // 2) Create upload session (PUT /api/v4/file/upload)
   emit(job, { status: "uploading", phase: "create session", percent: 42 });
+
+  if (!POLICY_ID) {
+    throw new Error("DOGPAN_POLICY_ID မရှိပါ — ပုံထဲက အတိုင်း 'GwcL' ထည့်ပါ");
+  }
+
   const sessionBody = {
     uri: `${DEST_URI}/${encodeUriName(name)}`,
     size,
-    policy_id: POLICY_ID,            // ⚠️ "Gwc1" — undefined မဖြစ်အောင် အမြဲ ထည့်
+    policy_id: POLICY_ID,            // "GwcL"
     last_modified: Date.now(),
     mime_type: mime,                 // video/mp4 …
   };
-
-  if (!POLICY_ID) {
-    throw new Error("DOGPAN_POLICY_ID မရှိပါ — ပုံထဲက အတိုင်း 'Gwc1' ထည့်ပါ");
-  }
 
   let sessResp;
   try {
     sessResp = await apiRequest("PUT", "/api/v4/file/upload", sessionBody);
   } catch (e) {
+    // 401 = token/cookie ပြဿနာ — အတိအကျ ပြ
+    if (e.code === 401 || /login required|unauthor/i.test(e.message)) {
+      throw new Error(
+        "401 Login required — DOGPAN_TOKEN (Bearer) သို့ DOGPAN_COOKIE (server_name_session) " +
+        "မှန်/သက်တမ်းမကုန်အောင် စစ်ပါ။ ပုံ(2:38PM) ထဲက Cookie: server_name_session=... ကို " +
+        "DOGPAN_COOKIE env ထဲ ထည့်ဖို့ မမေ့ပါနဲ့ — token တစ်ခုတည်းနဲ့ 401 ဖြစ်တတ်ပါတယ်။"
+      );
+    }
     // unknown policy id ဆို env ကို ပြန်စစ်ဖို့ ရှင်းရှင်းပြ
     if (/policy/i.test(e.message)) {
       throw new Error(
         `Session create fail (${e.message}). ` +
-        `policy_id="${POLICY_ID}" ကို စစ်ပါ — ပုံထဲက အတိုင်း "Gwc1" (G-w-c-ဂဏန်းတစ်) ဖြစ်ရမယ်၊ "Gwcl"(L) မဟုတ်ပါ။`
+        `policy_id="${POLICY_ID}" ကို စစ်ပါ — ပုံထဲက အတိုင်း "GwcL" (G-w-c-အင်္ဂလိပ်L) ဖြစ်ရမယ်၊ "Gwc1"(ဂဏန်း) မဟုတ်ပါ။`
       );
     }
     throw e;
@@ -348,7 +376,7 @@ async function cloudreveUpload(job, sourceUrl, filename) {
     }
   }
   // 4b) Cloudreve "Complete S3 upload" callback — GET /api/v4/callback/s3/{sessionId}
-  //  ⚠️ ပုံ ၆ မှာ ဒီ callback က GET method နဲ့ ဖြစ်တာ မြင်ရတယ် (Request Method: GET)
+  //  ⚠️ ပုံ(1:37 PM hSG1MeWE) မှာ ဒီ callback က GET method နဲ့ ဖြစ်တာ မြင်ရတယ်
   if (sessionId) {
     try {
       await apiRequest("GET", `/api/v4/callback/s3/${sessionId}`);
@@ -384,6 +412,9 @@ app.post("/api/upload", (req, res) => {
   const { url, filename } = req.body || {};
   if (!url) return res.status(400).json({ error: "URL လိုအပ်ပါသည်" });
   if (!DOGPAN_TOKEN) return res.status(500).json({ error: "DOGPAN_TOKEN မရှိပါ (Cloudreve Bearer token)" });
+  if (!DOGPAN_COOKIE) {
+    console.warn("[warn] DOGPAN_COOKIE မပါ — 401 Login required ဖြစ်နိုင်ပါတယ်။");
+  }
   const job = newJob();
   runUpload(job, url, filename).catch(() => {});
   res.json({ jobId: job.id });
