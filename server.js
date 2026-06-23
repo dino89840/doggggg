@@ -17,9 +17,9 @@ const API_BASE = (process.env.DOGPAN_API || "https://dogpan.com").replace(/\/+$/
 // Cloudreve login token (Bearer). ပုံထဲက Authorization: Bearer eyJhbG... အတိုင်း
 const DOGPAN_TOKEN = process.env.DOGPAN_TOKEN || "";
 // upload လုပ်မယ့် target folder (cloudreve URI). ဥပမာ cloudreve://my/iiii
-const DEST_URI = process.env.DOGPAN_DEST_URI || "cloudreve://my";
-// storage policy id (ပုံ ၈ မှာ "Gwc1"). session create အတွက် လို
-const POLICY_ID = process.env.DOGPAN_POLICY_ID || "";
+const DEST_URI = (process.env.DOGPAN_DEST_URI || "cloudreve://my").replace(/\/+$/, "");
+// storage policy id — ⚠️ ပုံထဲက အတိုင်း "Gwc1" (G-w-c-ONE). env မှာ မှန်အောင်ထည့်ပါ!
+const POLICY_ID = process.env.DOGPAN_POLICY_ID || "Gwc1";
 
 const MAX_RETRY = Number(process.env.MAX_RETRY || 4);
 const DL_TIMEOUT = Number(process.env.DL_TIMEOUT || 600000);
@@ -40,6 +40,24 @@ function getFileName(url, fallback) {
     if (name && name.length) return name;
   } catch {}
   return fallback || `file_${Date.now()}.bin`;
+}
+
+// filename ကို cloudreve URI path အတွက် encode (space -> %20 …)
+function encodeUriName(name) {
+  return encodeURIComponent(name).replace(/%2F/gi, "/");
+}
+
+// extension ကနေ mime ခန့်မှန်း (session create အတွက်)
+function guessMime(name) {
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  const map = {
+    mp4: "video/mp4", mkv: "video/x-matroska", mov: "video/quicktime",
+    avi: "video/x-msvideo", webm: "video/webm", m4v: "video/x-m4v",
+    mp3: "audio/mpeg", m4a: "audio/mp4", flac: "audio/flac",
+    jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
+    webp: "image/webp", pdf: "application/pdf", zip: "application/zip",
+  };
+  return map[ext] || "application/octet-stream";
 }
 
 // ── Generic JSON request helper (Cloudreve API) ──
@@ -76,10 +94,13 @@ function apiRequest(method, urlPath, body, extraHeaders = {}) {
         res.on("end", () => {
           let json = null;
           try { json = JSON.parse(raw); } catch {}
-          if (res.statusCode >= 200 && res.statusCode < 300) {
+          // Cloudreve က HTTP 200 ထဲမှာ code != 0 နဲ့ error ပြန်တတ်တယ်
+          if (res.statusCode >= 200 && res.statusCode < 300 && (!json || json.code === undefined || json.code === 0)) {
             resolve({ status: res.statusCode, json, raw });
           } else {
-            reject(new Error(`API ${method} ${urlPath} -> HTTP ${res.statusCode} ${raw.slice(0, 300)}`));
+            const msg = json?.msg || raw.slice(0, 300);
+            const code = json?.code !== undefined ? json.code : res.statusCode;
+            reject(new Error(`API ${method} ${urlPath} -> code ${code}: ${msg}`));
           }
         });
       }
@@ -91,7 +112,7 @@ function apiRequest(method, urlPath, body, extraHeaders = {}) {
   });
 }
 
-// ── Source URL ဖွင့်ပြီး stream + size + filename ပြန်ပေး (redirect follow) ──
+// ── Source URL ဖွင့်ပြီး stream + size + filename + contentType ပြန်ပေး (redirect follow) ──
 function openSource(url, depth = 0) {
   return new Promise((resolve, reject) => {
     if (depth > 5) return reject(new Error("Too many redirects"));
@@ -111,13 +132,14 @@ function openSource(url, depth = 0) {
           return reject(new Error(`Download failed: HTTP ${res.statusCode}`));
         }
         const total = Number(res.headers["content-length"]) || 0;
+        const contentType = res.headers["content-type"] || "";
         let cdName = "";
         const cd = res.headers["content-disposition"];
         if (cd) {
           const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd);
           if (m) { try { cdName = decodeURIComponent(m[1]); } catch { cdName = m[1]; } }
         }
-        resolve({ stream: res, total, cdName });
+        resolve({ stream: res, total, cdName, contentType });
       }
     );
     req.on("error", reject);
@@ -125,12 +147,11 @@ function openSource(url, depth = 0) {
   });
 }
 
-// ── source ကို buffer အဖြစ် download (chunk ခွဲဖို့ size သိဖို့ + retry လုပ်နိုင်ဖို့) ──
-// မှတ်ချက်: file ကြီးရင် memory များတယ်။ DISK_TMP=true ဆိုရင် /tmp ထဲ သိမ်းနိုင်အောင် တိုးချဲ့လို့ရ
+// ── source ကို buffer အဖြစ် download ──
 function downloadToBuffer(url, onProgress) {
   return new Promise(async (resolve, reject) => {
     try {
-      const { stream, total, cdName } = await openSource(url);
+      const { stream, total, cdName, contentType } = await openSource(url);
       const chunks = [];
       let got = 0;
       stream.on("data", (c) => {
@@ -138,7 +159,9 @@ function downloadToBuffer(url, onProgress) {
         got += c.length;
         if (onProgress) onProgress(got, total);
       });
-      stream.on("end", () => resolve({ buffer: Buffer.concat(chunks), total: total || got, cdName }));
+      stream.on("end", () =>
+        resolve({ buffer: Buffer.concat(chunks), total: total || got, cdName, contentType })
+      );
       stream.on("error", reject);
     } catch (e) { reject(e); }
   });
@@ -166,7 +189,6 @@ function putChunk(uploadUrl, buf) {
         res.on("data", (c) => (body += c.toString().slice(0, 300)));
         res.on("end", () => {
           if (res.statusCode >= 200 && res.statusCode < 300) {
-            // S3 က ETag ကို response header မှာ ပြန်ပေးတယ်
             const etag = (res.headers.etag || res.headers.ETag || "").replace(/"/g, "");
             resolve({ etag, status: res.statusCode });
           } else {
@@ -182,7 +204,7 @@ function putChunk(uploadUrl, buf) {
   });
 }
 
-// ── S3 CompleteMultipartUpload (XML) ── (presigned complete URL ရှိရင်)
+// ── S3 CompleteMultipartUpload (XML) ──
 function s3CompleteMultipart(completeUrl, parts) {
   return new Promise((resolve, reject) => {
     const xml =
@@ -241,24 +263,44 @@ function emit(job, patch = {}) {
 async function cloudreveUpload(job, sourceUrl, filename) {
   // 1) source download (size သိဖို့ + chunk ခွဲဖို့)
   emit(job, { status: "downloading", phase: "source download", percent: 0 });
-  const { buffer, total, cdName } = await downloadToBuffer(sourceUrl, (got, t) => {
+  const { buffer, total, cdName, contentType } = await downloadToBuffer(sourceUrl, (got, t) => {
     const pct = t ? Math.floor((got / t) * 40) : 0; // download = 0-40%
     emit(job, { loaded: got, total: t, percent: pct });
   });
 
   const name = filename || cdName || getFileName(sourceUrl);
   const size = buffer.length;
+  // mime — source ရဲ့ content-type ရှိရင် သုံး၊ မရှိရင် ext ကနေ ခန့်မှန်း
+  const mime = (contentType && !contentType.includes("octet-stream")) ? contentType.split(";")[0] : guessMime(name);
 
   // 2) Create upload session (PUT /api/v4/file/upload)
   emit(job, { status: "uploading", phase: "create session", percent: 42 });
   const sessionBody = {
-    uri: `${DEST_URI}/${name}`,
+    uri: `${DEST_URI}/${encodeUriName(name)}`,
     size,
-    policy_id: POLICY_ID || undefined,
-    mime_type: "application/octet-stream",
+    policy_id: POLICY_ID,            // ⚠️ "Gwc1" — undefined မဖြစ်အောင် အမြဲ ထည့်
     last_modified: Date.now(),
+    mime_type: mime,                 // video/mp4 …
   };
-  const sessResp = await apiRequest("PUT", "/api/v4/file/upload", sessionBody);
+
+  if (!POLICY_ID) {
+    throw new Error("DOGPAN_POLICY_ID မရှိပါ — ပုံထဲက အတိုင်း 'Gwc1' ထည့်ပါ");
+  }
+
+  let sessResp;
+  try {
+    sessResp = await apiRequest("PUT", "/api/v4/file/upload", sessionBody);
+  } catch (e) {
+    // unknown policy id ဆို env ကို ပြန်စစ်ဖို့ ရှင်းရှင်းပြ
+    if (/policy/i.test(e.message)) {
+      throw new Error(
+        `Session create fail (${e.message}). ` +
+        `policy_id="${POLICY_ID}" ကို စစ်ပါ — ပုံထဲက အတိုင်း "Gwc1" (G-w-c-ဂဏန်းတစ်) ဖြစ်ရမယ်၊ "Gwcl"(L) မဟုတ်ပါ။`
+      );
+    }
+    throw e;
+  }
+
   const session = sessResp.json?.data || sessResp.json;
   if (!session || !session.upload_urls || !session.upload_urls.length) {
     throw new Error("Upload session response invalid: " + JSON.stringify(sessResp.json).slice(0, 300));
@@ -305,14 +347,14 @@ async function cloudreveUpload(job, sourceUrl, filename) {
       console.warn("[s3 complete] " + e.message);
     }
   }
-  // 4b) Cloudreve callback (S3 storage policy)
-  //  POST /api/v4/callback/s3/{sessionId}
+  // 4b) Cloudreve "Complete S3 upload" callback — GET /api/v4/callback/s3/{sessionId}
+  //  ⚠️ ပုံ ၆ မှာ ဒီ callback က GET method နဲ့ ဖြစ်တာ မြင်ရတယ် (Request Method: GET)
   if (sessionId) {
     try {
-      await apiRequest("POST", `/api/v4/callback/s3/${sessionId}`, {});
+      await apiRequest("GET", `/api/v4/callback/s3/${sessionId}`);
     } catch (e) {
-      // callback က GET ဖြစ်တဲ့ instance တွေလည်း ရှိတတ်လို့ fallback
-      try { await apiRequest("GET", `/api/v4/callback/s3/${sessionId}`); }
+      // POST လည်း fallback စမ်း
+      try { await apiRequest("POST", `/api/v4/callback/s3/${sessionId}`, {}); }
       catch (e2) { console.warn("[callback] " + e.message + " | " + e2.message); }
     }
   }
