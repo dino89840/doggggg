@@ -2,12 +2,8 @@ import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
-import fs from "fs";
-import fsp from "fs/promises";
-import os from "os";
 import http from "http";
 import https from "https";
-import { pipeline } from "stream/promises";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,23 +11,23 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const WEBDAV_URL = (process.env.WEBDAV_URL || "https://dogpan.com/dav").replace(/\/$/, "");
+// ── Config ──
+// dogpan က /dav ကို သုံးခိုင်းထားလို့ default အဖြစ် ထားပါတယ်
+const WEBDAV_URL = (process.env.WEBDAV_URL || "https://dogpan.com/dav").replace(/\/+$/, "");
 const WEBDAV_USER = process.env.WEBDAV_USER || "";
 const WEBDAV_PASS = process.env.WEBDAV_PASS || "";
-
-// Chunk size ကို 5MB သို့ လျှော့ချပြီး Server load ကို လျှော့ချထားပါသည်
-const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 5 * 1024 * 1024); 
-const MAX_RETRY = Number(process.env.MAX_RETRY || 6);
-// Chunk တစ်ခုနှင့်တစ်ခုကြား ၁ စက္ကန့် (1000ms) ခြားပြီး DogPan ကို အသက်ရှူချိန်ပေးထားပါသည်
-const CHUNK_DELAY = Number(process.env.CHUNK_DELAY || 1000); 
-const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT || 120000);
+const MAX_RETRY = Number(process.env.MAX_RETRY || 4);
+const DL_TIMEOUT = Number(process.env.DL_TIMEOUT || 180000);
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-// ── HTTP Agents for High Speed ──
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 64 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64 });
+// ── Keep-alive agents ──
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 32 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 32 });
+const agentFor = (u) => (u.startsWith("https") ? httpsAgent : httpAgent);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function authHeader() {
   return "Basic " + Buffer.from(`${WEBDAV_USER}:${WEBDAV_PASS}`).toString("base64");
@@ -41,27 +37,19 @@ function getFileName(url, fallback) {
   try {
     const u = new URL(url);
     const name = decodeURIComponent(u.pathname.split("/").pop());
-    if (name && name.includes(".")) return name;
+    if (name && name.length) return name;
   } catch {}
   return fallback || `file_${Date.now()}`;
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function fetchT(url, options = {}, timeout = REQUEST_TIMEOUT) {
-  if (!timeout || timeout <= 0) {
-    return await fetch(url, options);
-  }
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeout);
-  try {
-    return await fetch(url, { ...options, signal: ctrl.signal });
-  } finally {
-    clearTimeout(id);
-  }
+// WebDAV path: dogpan က /dav ဆီ တိုက်ရိုက်တင်တာ (root = user ရဲ့ files)
+// filename ထဲက path-unsafe char တွေကိုသာ encode လုပ်တယ်
+function buildDestination(name) {
+  const safe = encodeURIComponent(name);
+  return `${WEBDAV_URL}/${safe}`;
 }
 
-// ── Background Jobs Store ──
+// ── Jobs store ──
 const jobs = new Map();
 function newJob() {
   const id = crypto.randomBytes(8).toString("hex");
@@ -77,7 +65,7 @@ function newJob() {
     createdAt: Date.now(),
   };
   jobs.set(id, job);
-  setTimeout(() => jobs.delete(id), 2 * 60 * 60 * 1000); // Clean after 2 hours
+  setTimeout(() => jobs.delete(id), 2 * 60 * 60 * 1000);
   return job;
 }
 
@@ -96,209 +84,150 @@ function emit(job, patch = {}) {
   }
 }
 
-// ── Local Disk Downloader with progress ──
-function downloadToFile(url, destPath, onProgress) {
+// ── Source URL ကို request လုပ်ပြီး stream + size + filename ပြန်ပေး (redirect follow) ──
+function openSource(url, depth = 0) {
   return new Promise((resolve, reject) => {
+    if (depth > 5) return reject(new Error("Too many redirects"));
     const lib = url.startsWith("https") ? https : http;
-    const req = lib.get(url, {
-      agent: url.startsWith("https") ? httpsAgent : httpAgent,
-      headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*" },
-    }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        const next = new URL(res.headers.location, url).toString();
-        downloadToFile(next, destPath, onProgress).then(resolve, reject);
-        return;
-      }
-      if (res.statusCode !== 200 && res.statusCode !== 206) {
-        res.resume();
-        return reject(new Error(`Download failed: HTTP ${res.statusCode}`));
-      }
-      const total = Number(res.headers["content-length"]) || 0;
-      let loaded = 0;
-      res.on("data", (chunk) => {
-        loaded += chunk.length;
-        if (onProgress) onProgress(loaded, total);
-      });
-      const ws = fs.createWriteStream(destPath);
-      pipeline(res, ws).then(() => resolve({ total: total || loaded })).catch(reject);
-    });
-    req.on("error", reject);
-    req.setTimeout(180000, () => req.destroy(new Error("Download timeout")));
-  });
-}
-
-async function putWithRetry(targetUrl, headers, body, label) {
-  let lastErr;
-  for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
-    try {
-      const r = await fetchT(targetUrl, { method: "PUT", headers, body });
-      if (r.ok || r.status === 201 || r.status === 204) return r;
-      
-      lastErr = new Error(`${label} fail (HTTP ${r.status})`);
-
-      // DogPan (Nextcloud) ဘက်က Busy ဖြစ်ပြီး 502/503/504 ပေးပါက အချိန်ပိုစောင့်ပြီးမှ Retry ပြန်လုပ်ပါမည်
-      if (r.status === 502 || r.status === 503 || r.status === 504) {
-        console.warn(`[DogPan Busy] ${label} got HTTP ${r.status}. Attempt ${attempt}/${MAX_RETRY}. Waiting...`);
-        if (attempt < MAX_RETRY) {
-          await sleep(4000 * attempt); // 4s, 8s, 12s စသဖြင့် တိုးမြှင့်စောင့်ဆိုင်းပါမည်
-          continue;
-        }
-      }
-    } catch (e) {
-      lastErr = e;
-    }
-    if (attempt < MAX_RETRY) await sleep(2000 * attempt);
-  }
-  throw lastErr;
-}
-
-async function putAssembleWithRetry(uploadDir, destination, total) {
-  let lastErr;
-  for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
-    try {
-      const r = await fetchT(
-        `${uploadDir}/.file`,
-        {
-          method: "MOVE",
-          headers: {
-            Authorization: authHeader(),
-            Destination: destination,
-            "OC-Total-Length": String(total),
-          },
-        },
-        300000
-      );
-      if (r.ok || r.status === 201 || r.status === 204) return r;
-      lastErr = new Error(`MOVE/assemble fail (HTTP ${r.status})`);
-
-      if (r.status === 502 || r.status === 503 || r.status === 504) {
-        if (attempt < MAX_RETRY) {
-          await sleep(5000 * attempt);
-          continue;
-        }
-      }
-    } catch (e) {
-      lastErr = e;
-    }
-    if (attempt < MAX_RETRY) await sleep(3000 * attempt);
-  }
-  throw lastErr;
-}
-
-function buildPaths(name) {
-  const userId = WEBDAV_USER.split("@")[0] || WEBDAV_USER;
-  const base = WEBDAV_URL.replace(/\/dav$/, "").replace(/\/remote\.php\/dav$/, "");
-  const uploadRoot = `${base}/remote.php/dav/uploads/${userId}`;
-  const filesRoot = `${base}/remote.php/dav/files/${userId}`;
-  const uploadId = `remoteupload-${crypto.randomUUID()}`;
-  const uploadDir = `${uploadRoot}/${uploadId}`;
-  const destination = `${filesRoot}/${encodeURIComponent(name)}`;
-  return { uploadDir, destination };
-}
-
-// Helper to read file chunk safely into Buffer
-async function readChunkSlice(localPath, start, length) {
-  const fd = await fsp.open(localPath, "r");
-  try {
-    const buffer = Buffer.alloc(length);
-    const { bytesRead } = await fd.read(buffer, 0, length, start);
-    return bytesRead < length ? buffer.subarray(0, bytesRead) : buffer;
-  } finally {
-    await fd.close();
-  }
-}
-
-// ── Upload from local disk in chunks ──
-async function uploadFromDiskInChunks(localPath, name, onProgress) {
-  const { uploadDir, destination } = buildPaths(name);
-
-  let r = await fetchT(uploadDir, {
-    method: "MKCOL",
-    headers: { Authorization: authHeader(), Destination: destination },
-  });
-  if (!r.ok && r.status !== 201 && r.status !== 405) {
-    throw new Error(`MKCOL fail (HTTP ${r.status})`);
-  }
-
-  const stat = fs.statSync(localPath);
-  const totalSize = stat.size;
-  const totalChunks = Math.ceil(totalSize / CHUNK_SIZE);
-  let uploaded = 0;
-
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * CHUNK_SIZE;
-    const end = Math.min(start + CHUNK_SIZE - 1, totalSize - 1);
-    const chunkLength = end - start + 1;
-
-    const chunkBuffer = await readChunkSlice(localPath, start, chunkLength);
-    const chunkName = String(i + 1).padStart(5, "0");
-
-    await putWithRetry(
-      `${uploadDir}/${chunkName}`,
+    const req = lib.get(
+      url,
       {
-        Authorization: authHeader(),
-        Destination: destination,
-        "OC-Total-Length": String(totalSize),
-        "Content-Type": "application/octet-stream",
-        "Content-Length": String(chunkLength),
+        agent: agentFor(url),
+        headers: { "User-Agent": "Mozilla/5.0", Accept: "*/*" },
       },
-      chunkBuffer,
-      `Chunk ${i + 1}`
+      (res) => {
+        // redirect
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          const next = new URL(res.headers.location, url).toString();
+          openSource(next, depth + 1).then(resolve, reject);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+        }
+        const total = Number(res.headers["content-length"]) || 0;
+
+        // filename: content-disposition ရှိရင် ဦးစားပေး
+        let cdName = "";
+        const cd = res.headers["content-disposition"];
+        if (cd) {
+          const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd);
+          if (m) { try { cdName = decodeURIComponent(m[1]); } catch { cdName = m[1]; } }
+        }
+        resolve({ stream: res, total, cdName });
+      }
+    );
+    req.on("error", reject);
+    req.setTimeout(DL_TIMEOUT, () => req.destroy(new Error("Download timeout")));
+  });
+}
+
+// ── Streaming PUT: source stream ကို WebDAV ဆီ တိုက်ရိုက် pipe ──
+// (disk မဖြတ်ဘူး — server မှာ နေရာမယူဘူး၊ ပိုမြန်တယ်)
+function streamPut(destination, stream, total, onProgress) {
+  return new Promise((resolve, reject) => {
+    const lib = destination.startsWith("https") ? https : http;
+    const u = new URL(destination);
+
+    const headers = {
+      Authorization: authHeader(),
+      "Content-Type": "application/octet-stream",
+    };
+    // size သိရင် Content-Length ထည့် (မသိရင် chunked transfer သုံးမယ်)
+    if (total > 0) headers["Content-Length"] = String(total);
+
+    const req = lib.request(
+      {
+        method: "PUT",
+        hostname: u.hostname,
+        port: u.port || (destination.startsWith("https") ? 443 : 80),
+        path: u.pathname + u.search,
+        headers,
+        agent: agentFor(destination),
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (c) => (body += c.toString().slice(0, 500)));
+        res.on("end", () => {
+          if ([200, 201, 204].includes(res.statusCode)) {
+            resolve({ status: res.statusCode });
+          } else {
+            reject(
+              new Error(`Upload fail HTTP ${res.statusCode} ${body.slice(0, 200)}`)
+            );
+          }
+        });
+      }
     );
 
-    uploaded += chunkLength;
-    if (onProgress) onProgress(uploaded, totalSize);
-    if (CHUNK_DELAY > 0) await sleep(CHUNK_DELAY);
-  }
+    req.on("error", reject);
+    req.setTimeout(0); // upload အကြာကြီး timeout မဖြစ်စေဖို့
 
-  r = await putAssembleWithRetry(uploadDir, destination, totalSize);
-  if (!r.ok && r.status !== 201 && r.status !== 204) {
-    throw new Error(`MOVE/assemble fail (HTTP ${r.status})`);
-  }
+    let uploaded = 0;
+    stream.on("data", (chunk) => {
+      uploaded += chunk.length;
+      if (onProgress) onProgress(uploaded, total);
+    });
+    stream.on("error", (e) => req.destroy(e));
 
-  return { destination, size: totalSize };
+    stream.pipe(req);
+  });
 }
 
-// ── Main Async Runner ──
-async function runUpload(job, url, filename) {
-  const tmpRoot = path.join(os.tmpdir(), `dogpan-${job.id}`);
-  await fsp.mkdir(tmpRoot, { recursive: true });
-  const localFile = path.join(tmpRoot, "download.tmp");
+// ── MKCOL မလို — root /dav ဆီ တိုက်ရိုက် PUT ──
+// retry အတွက် source ကို ပြန်ဖွင့်ရတယ် (stream က once-only ဖြစ်လို့)
+async function uploadWithRetry(url, destination, job) {
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
+    try {
+      const { stream, total, cdName } = await openSource(url);
+      job.serverFileName = cdName; // optional
+      if (total) emit(job, { total });
 
+      const r = await streamPut(destination, stream, total, (uploaded, t) => {
+        const pct = t ? Math.min(99, Math.floor((uploaded / t) * 100)) : 0;
+        emit(job, { loaded: uploaded, total: t, percent: pct });
+      });
+      return r;
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e.message || "");
+      // server busy (502/503/504) ဖြစ်ရင် ပိုစောင့်ပြီး retry
+      const busy = /HTTP 50[234]/.test(msg);
+      console.warn(`[upload] attempt ${attempt}/${MAX_RETRY} failed: ${msg}`);
+      if (attempt < MAX_RETRY) {
+        await sleep((busy ? 4000 : 2000) * attempt);
+        emit(job, { status: "retrying", percent: 0, loaded: 0 });
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// ── Main runner ──
+async function runUpload(job, url, filename) {
   try {
     const name = getFileName(url, filename);
+    const destination = buildDestination(name);
 
-    // Phase 1: Download to Local Disk (0% to 40% progress)
-    emit(job, { status: "downloading", percent: 0 });
-    await downloadToFile(url, localFile, (loaded, total) => {
-      const pct = total ? Math.floor((loaded / total) * 40) : 0;
-      emit(job, { loaded, total, percent: pct });
-    });
+    emit(job, { status: "uploading", percent: 0 });
+    await uploadWithRetry(url, destination, job);
 
-    // Phase 2: Upload Chunks from Disk to WebDAV (40% to 95% progress)
-    emit(job, { status: "uploading", percent: 40 });
-    const { destination, size } = await uploadFromDiskInChunks(localFile, name, (uploaded, total) => {
-      const pct = total ? Math.floor(40 + (uploaded / total) * 55) : 40;
-      emit(job, { loaded: uploaded, total, percent: pct });
-    });
-
-    // Finished
     emit(job, {
       status: "done",
       percent: 100,
       result: {
         destination,
-        size,
-        message: "အောင်မြင်စွာ တင်ပြီးပါပြီ",
+        name,
+        message: "အောင်မြင်စွာ တင်ပြီးပါပြီ ✅",
       },
     });
   } catch (err) {
-    console.error(err);
+    console.error("[runUpload]", err);
     emit(job, { status: "error", error: err.message || "တင်မရပါ" });
   } finally {
-    // Cleanup temporary files
-    fsp.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
     for (const res of job.listeners) {
       try { res.end(); } catch (_) {}
     }
@@ -311,15 +240,13 @@ app.post("/api/upload", (req, res) => {
   const { url, filename } = req.body || {};
   if (!url) return res.status(400).json({ error: "URL လိုအပ်ပါသည်" });
   if (!WEBDAV_USER || !WEBDAV_PASS) {
-    return res.status(500).json({ error: "WEBDAV config များ မစုံလင်ပါ" });
+    return res.status(500).json({ error: "WEBDAV_USER / WEBDAV_PASS မပြည့်စုံပါ" });
   }
-
   const job = newJob();
   runUpload(job, url, filename).catch(() => {});
   res.json({ jobId: job.id });
 });
 
-// SSE progress monitor
 app.get("/api/progress/:id", (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).end();
@@ -327,32 +254,83 @@ app.get("/api/progress/:id", (req, res) => {
   res.set({
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
+    Connection: "keep-alive",
   });
   res.flushHeaders?.();
 
-  // Initial event
   res.write(`data: ${JSON.stringify({
-    status: job.status, loaded: job.loaded, total: job.total, percent: job.percent, result: job.result, error: job.error
+    status: job.status, loaded: job.loaded, total: job.total,
+    percent: job.percent, result: job.result, error: job.error,
   })}\n\n`);
 
-  if (job.status === "done" || job.status === "error") {
-    return res.end();
-  }
+  if (job.status === "done" || job.status === "error") return res.end();
 
   job.listeners.add(res);
   req.on("close", () => job.listeners.delete(res));
 });
 
-// Keep-Alive for SSE
+// SSE keep-alive
 setInterval(() => {
   for (const job of jobs.values()) {
-    if (job.listeners.size === 0) continue;
     for (const res of job.listeners) {
-      try { res.write(`: keep-alive\n\n`); } catch (_) {}
+      try { res.write(`: ping\n\n`); } catch (_) {}
     }
   }
 }, 15000).unref();
 
+// ── Simple UI (public folder မရှိရင်လည်း သုံးလို့ရအောင်) ──
+app.get("/", (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DogPan Remote Uploader</title>
+<style>
+body{font-family:system-ui;max-width:600px;margin:40px auto;padding:0 16px}
+input{width:100%;padding:12px;font-size:16px;box-sizing:border-box;margin:8px 0}
+button{padding:12px 24px;font-size:16px;background:#d97706;color:#fff;border:0;border-radius:6px}
+button:disabled{opacity:.5}
+.bar{height:24px;background:#e5e7eb;border-radius:12px;overflow:hidden;margin:12px 0;display:none}
+.fill{height:100%;width:0;background:#d97706;transition:width .3s;color:#fff;text-align:center;font-size:13px;line-height:24px}
+#stat{font-size:14px;color:#444;margin:6px 0}
+pre{background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto;white-space:pre-wrap}
+</style></head><body>
+<h2>DogPan Remote Uploader</h2>
+<p>File link ထည့်ပါ — server က download ပြီး dogpan WebDAV ဆီ auto တင်ပေးပါမယ်။</p>
+<input id="url" placeholder="https://example.com/file.mp4">
+<input id="fn" placeholder="(optional) filename — ဥပမာ movie.mp4">
+<button id="btn" onclick="go()">Upload</button>
+<div class="bar" id="bar"><div class="fill" id="fill">0%</div></div>
+<div id="stat"></div>
+<pre id="out"></pre>
+<script>
+function fmt(b){if(!b)return'?';const u=['B','KB','MB','GB'];let i=0;while(b>=1024&&i<3){b/=1024;i++;}return b.toFixed(1)+u[i];}
+async function go(){
+  const url=document.getElementById('url').value.trim();
+  const fn=document.getElementById('fn').value.trim();
+  const out=document.getElementById('out'),bar=document.getElementById('bar');
+  const fill=document.getElementById('fill'),stat=document.getElementById('stat'),btn=document.getElementById('btn');
+  if(!url){out.textContent='Link ထည့်ပါ';return;}
+  out.textContent='';stat.textContent='';btn.disabled=true;
+  bar.style.display='block';fill.style.width='0%';fill.textContent='0%';
+  try{
+    const r=await fetch('/api/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,filename:fn})});
+    const d=await r.json();
+    if(!d.jobId){out.textContent='Error: '+(d.error||'unknown');btn.disabled=false;return;}
+    const es=new EventSource('/api/progress/'+d.jobId);
+    es.onmessage=(ev)=>{
+      const j=JSON.parse(ev.data);
+      fill.style.width=j.percent+'%';fill.textContent=j.percent+'%';
+      let line=j.status;
+      if(j.loaded||j.total)line+=' — '+fmt(j.loaded)+(j.total?' / '+fmt(j.total):'');
+      stat.textContent=line;
+      if(j.status==='done'){es.close();btn.disabled=false;out.textContent=JSON.stringify(j.result,null,2);stat.textContent='✅ ပြီးပါပြီ';}
+      if(j.status==='error'){es.close();btn.disabled=false;out.textContent='❌ '+j.error;}
+    };
+    es.onerror=()=>{es.close();btn.disabled=false;};
+  }catch(e){out.textContent='Error: '+e.message;btn.disabled=false;}
+}
+</script>
+</body></html>`);
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
-app.listen(PORT, () => console.log(`🚀 DogPan Server on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 DogPan Uploader on port ${PORT}`));
